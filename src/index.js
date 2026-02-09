@@ -428,9 +428,31 @@ app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
 
   const snap = await query.get();
   const users = snap.docs.map((doc) => ({ id: doc.id, ...serializeUser(doc.data()) }));
+  const refIds = Array.from(
+    new Set(users.map((user) => user.referredBy).filter(Boolean))
+  );
+  const refMap = {};
+  if (refIds.length) {
+    const refSnaps = await Promise.all(
+      refIds.map((refId) => db.collection("users").doc(refId).get())
+    );
+    refSnaps.forEach((refSnap) => {
+      if (refSnap.exists) {
+        refMap[refSnap.id] = refSnap.data();
+      }
+    });
+  }
+
+  const usersWithRefs = users.map((user) => ({
+    ...user,
+    referredByName:
+      user.referredBy && refMap[user.referredBy]
+        ? refMap[user.referredBy].fullName || refMap[user.referredBy].email || user.referredBy
+        : null,
+  }));
   const nextCursor = snap.docs.length ? snap.docs[snap.docs.length - 1].id : null;
 
-  res.json({ users, nextCursor });
+  res.json({ users: usersWithRefs, nextCursor });
 });
 
 app.patch("/admin/users/:uid", requireAuth, requireAdmin, async (req, res) => {
