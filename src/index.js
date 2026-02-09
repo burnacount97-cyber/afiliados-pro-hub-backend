@@ -166,6 +166,8 @@ const findUserByReferral = async (referralCode) => {
   return { id: doc.id, ...doc.data() };
 };
 
+const isValidReferralCode = (code) => /^AF-[A-Z0-9]{4,}$/.test(code);
+
 const ensureStats = async (uid, planId) => {
   const statsRef = db.collection("stats").doc(uid);
   const statsSnap = await statsRef.get();
@@ -196,6 +198,24 @@ const serializeUser = (doc) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/referrals/validate", async (req, res) => {
+  const rawCode = String(req.query.code || "").trim().toUpperCase();
+  if (!rawCode || !isValidReferralCode(rawCode)) {
+    return res.json({ valid: false });
+  }
+
+  const refUser = await findUserByReferral(rawCode);
+  if (!refUser) {
+    return res.json({ valid: false });
+  }
+
+  return res.json({
+    valid: true,
+    referrerId: refUser.id,
+    referrerName: refUser.fullName || refUser.email || "",
+  });
 });
 
 app.post("/users/bootstrap", requireAuth, async (req, res) => {
