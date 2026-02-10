@@ -4,7 +4,7 @@ import cors from "cors";
 import morgan from "morgan";
 import { cert, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { FieldValue, getFirestore } from "firebase-admin/firestore";
+import { FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
 import { z } from "zod";
 
 const PORT = process.env.PORT || 8080;
@@ -93,6 +93,17 @@ const plans = [
 ];
 
 const planOrder = ["basic", "pro", "elite"];
+const commissionByLevel = {
+  1: 50,
+  2: 20,
+  3: 10,
+  4: 5,
+};
+
+const SALES_API_KEY = process.env.SALES_API_KEY || "";
+const FX_PEN_TO_USD = Number.parseFloat(process.env.FX_PEN_TO_USD || "0.27");
+const REFUND_HOLD_DAYS = Number.parseInt(process.env.REFUND_HOLD_DAYS || "14", 10);
+const PAYOUT_MIN_USD = Number.parseFloat(process.env.PAYOUT_MIN_USD || "100");
 
 const defaultTools = [
   {
@@ -114,7 +125,7 @@ const defaultTools = [
     name: "Lead Widget",
     description: "Captura leads automaticamente desde tu web o redes sociales.",
     color: "purple",
-    minPlan: "pro",
+    minPlan: "basic",
   },
 ];
 
@@ -122,6 +133,18 @@ const planRank = (plan) => {
   const index = planOrder.indexOf(plan);
   return index === -1 ? 0 : index;
 };
+
+const planLevelCap = (plan) => {
+  if (plan === "elite") return 4;
+  if (plan === "pro") return 2;
+  return 1;
+};
+
+const formatUsd = (value) => `$ ${Number(value || 0).toFixed(2)}`;
+const round2 = (value) => Math.round(Number(value) * 100) / 100;
+const penToUsd = (penValue) => round2(Number(penValue || 0) * FX_PEN_TO_USD);
+const holdUntilDate = () =>
+  Timestamp.fromDate(new Date(Date.now() + REFUND_HOLD_DAYS * 24 * 60 * 60 * 1000));
 
 const requireAuth = async (req, res, next) => {
   const header = req.headers.authorization || "";
@@ -173,13 +196,20 @@ const ensureStats = async (uid, planId) => {
   const statsSnap = await statsRef.get();
   if (!statsSnap.exists) {
     await statsRef.set({
-      totalEarnings: 0,
-      availableBalance: 0,
+      totalEarningsUsd: 0,
+      availableBalanceUsd: 0,
+      pendingBalanceUsd: 0,
       plan: planId,
       networkTotal: 0,
       updatedAt: FieldValue.serverTimestamp(),
     });
   }
+};
+
+const resolvePlanLabel = (plan) => {
+  if (plan === "elite") return "Elite";
+  if (plan === "pro") return "Pro";
+  return "Basico";
 };
 
 const serializeUser = (doc) => {
@@ -194,6 +224,101 @@ const serializeUser = (doc) => {
     disabled: !!doc.disabled,
     createdAt: doc.createdAt || null,
   };
+};
+
+const fetchUsersByReferrers = async (referrerIds = []) => {
+  if (!referrerIds.length) return [];
+  const chunks = [];
+  for (let i = 0; i < referrerIds.length; i += 10) {
+    chunks.push(referrerIds.slice(i, i + 10));
+  }
+  const results = [];
+  for (const chunk of chunks) {
+    const snap = await db.collection("users").where("referredBy", "in", chunk).get();
+    if (!snap.empty) {
+      snap.docs.forEach((doc) => results.push({ id: doc.id, ...doc.data() }));
+    }
+  }
+  return results;
+};
+
+const buildDownline = async (rootUid, maxLevels = 4) => {
+  const members = [];
+  const counts = {};
+  let currentLevel = 1;
+  let currentIds = [rootUid];
+
+  while (currentLevel <= maxLevels && currentIds.length) {
+    const levelUsers = await fetchUsersByReferrers(currentIds);
+    counts[currentLevel] = levelUsers.length;
+
+    levelUsers.forEach((user) => {
+      members.push({
+        id: user.uid || user.id,
+        name: user.fullName || user.email || "Sin nombre",
+        plan: resolvePlanLabel(user.plan),
+        level: currentLevel,
+        earnings: formatUsd(0),
+      });
+    });
+
+    currentIds = levelUsers.map((user) => user.uid || user.id);
+    currentLevel += 1;
+  }
+
+  return { members, counts };
+};
+
+const getUpline = async (uid) => {
+  const userSnap = await db.collection("users").doc(uid).get();
+  if (!userSnap.exists) return null;
+  const user = userSnap.data();
+  if (!user?.referredBy) return null;
+  const refSnap = await db.collection("users").doc(user.referredBy).get();
+  if (!refSnap.exists) return null;
+  const refData = refSnap.data();
+  return {
+    uid: refSnap.id,
+    name: refData.fullName || refData.email || "",
+    plan: resolvePlanLabel(refData.plan),
+    referralCode: refData.referralCode || "",
+  };
+};
+
+const refreshPendingCommissions = async (uid) => {
+  const pendingSnap = await db
+    .collection("commissions")
+    .where("beneficiaryId", "==", uid)
+    .where("status", "==", "pending")
+    .where("holdUntil", "<=", Timestamp.now())
+    .get();
+
+  if (pendingSnap.empty) return;
+
+  let releasedTotal = 0;
+  const batch = db.batch();
+  pendingSnap.docs.forEach((doc) => {
+    const data = doc.data();
+    releasedTotal += Number(data.amountUsd || 0);
+    batch.update(doc.ref, {
+      status: "approved",
+      releasedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  });
+
+  const statsRef = db.collection("stats").doc(uid);
+  batch.set(
+    statsRef,
+    {
+      pendingBalanceUsd: FieldValue.increment(-releasedTotal),
+      availableBalanceUsd: FieldValue.increment(releasedTotal),
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await batch.commit();
 };
 
 app.get("/health", (_req, res) => {
@@ -260,19 +385,22 @@ app.post("/users/bootstrap", requireAuth, async (req, res) => {
     await userRef.set(userData);
 
     if (referredBy) {
-      await db
-        .collection("users")
-        .doc(referredBy)
-        .collection("network")
-        .doc(uid)
-        .set({
-          uid,
-          name: userData.fullName || userData.email,
-          plan: "basic",
-          level: 1,
-          earnings: "S/ 0.00",
-          createdAt: FieldValue.serverTimestamp(),
-        });
+      await db.collection("users").doc(referredBy).collection("network").doc(uid).set({
+        uid,
+        name: userData.fullName || userData.email,
+        plan: "basic",
+        level: 1,
+        earnings: formatUsd(0),
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      await db.collection("users").doc(referredBy).collection("activity").add({
+        name: userData.fullName || userData.email,
+        action: "se unio a tu red",
+        level: "Nivel 1",
+        time: "Ahora",
+        createdAt: FieldValue.serverTimestamp(),
+      });
     }
   }
 
@@ -294,6 +422,7 @@ app.get("/me", requireAuth, async (req, res) => {
 
 app.get("/dashboard", requireAuth, async (req, res) => {
   const uid = req.user.uid;
+  await refreshPendingCommissions(uid);
   const [userSnap, statsSnap, activitySnap] = await Promise.all([
     db.collection("users").doc(uid).get(),
     db.collection("stats").doc(uid).get(),
@@ -301,26 +430,29 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   ]);
 
   const user = userSnap.data();
-  const stats = statsSnap.data();
+  const stats = statsSnap.data() || {};
 
   const activity = activitySnap.empty
     ? []
     : activitySnap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
 
-  const networkSnap = await db.collection("users").doc(uid).collection("network").get();
-  const networkTotal = networkSnap.size;
+  const downline = await buildDownline(uid, 4);
+  const networkTotal = downline.members.length;
 
   const responseStats = [
     {
       title: "Ganancias Totales",
-      value: `S/ ${(stats?.totalEarnings ?? 0).toFixed(2)}`,
-      change: stats?.totalEarnings ? "+0%" : "Sin cambios",
+      value: formatUsd(stats.totalEarningsUsd ?? 0),
+      change: stats.totalEarningsUsd ? "+0%" : "Sin cambios",
       variant: "emerald",
     },
     {
       title: "Saldo Disponible",
-      value: `S/ ${(stats?.availableBalance ?? 0).toFixed(2)}`,
-      change: (stats?.availableBalance ?? 0) > 0 ? "Retirable" : "Sin saldo",
+      value: formatUsd(stats.availableBalanceUsd ?? 0),
+      change:
+        (stats.availableBalanceUsd ?? 0) >= PAYOUT_MIN_USD
+          ? "Listo para pago"
+          : `Min. ${formatUsd(PAYOUT_MIN_USD)}`,
       variant: "gold",
     },
     {
@@ -371,13 +503,7 @@ app.get("/network", requireAuth, async (req, res) => {
     { level: 4, commission: 5, unlockPlan: "Elite", unlocked: unlockedLevels >= 4 },
   ];
 
-  const membersSnap = await db.collection("users").doc(uid).collection("network").orderBy("createdAt", "desc").limit(50).get();
-  const members = membersSnap.empty ? [] : membersSnap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-  const counts = members.reduce((acc, member) => {
-    const level = member.level || 1;
-    acc[level] = (acc[level] || 0) + 1;
-    return acc;
-  }, {});
+  const { members, counts } = await buildDownline(uid, 4);
 
   const levels = baseLevels.map((lvl) => ({
     ...lvl,
@@ -386,12 +512,14 @@ app.get("/network", requireAuth, async (req, res) => {
 
   const totalPotential = 85;
   const currentPotential = planId === "elite" ? 85 : planId === "pro" ? 70 : 50;
+  const upline = await getUpline(uid);
 
   res.json({
     levels,
     members,
     totalPotential,
     currentPotential,
+    upline,
   });
 });
 
@@ -432,6 +560,125 @@ app.post("/subscription/upgrade", requireAuth, async (req, res) => {
   );
 
   res.json({ ok: true, plan });
+});
+
+app.post("/bundle/sales", async (req, res) => {
+  if (!SALES_API_KEY) {
+    return res.status(500).json({ error: "Sales key not configured" });
+  }
+
+  const headerKey = req.headers["x-sales-key"];
+  if (headerKey !== SALES_API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const schema = z
+    .object({
+      externalId: z.string().min(3).optional(),
+      buyerEmail: z.string().email(),
+      amountPen: z.number().positive(),
+      referralCode: z.string().min(3).optional(),
+      source: z.string().optional(),
+    })
+    .safeParse(req.body || {});
+
+  if (!schema.success) {
+    return res.status(400).json({ error: "Invalid payload" });
+  }
+
+  const { externalId, buyerEmail, amountPen, referralCode, source } = schema.data;
+  const saleId = externalId || db.collection("bundleSales").doc().id;
+  const saleRef = db.collection("bundleSales").doc(saleId);
+  const saleSnap = await saleRef.get();
+  if (saleSnap.exists) {
+    return res.json({ ok: true, saleId, status: "exists" });
+  }
+
+  const amountUsd = penToUsd(amountPen);
+  let referrer = null;
+  if (referralCode && isValidReferralCode(referralCode)) {
+    referrer = await findUserByReferral(referralCode.toUpperCase());
+  }
+
+  const holdUntil = holdUntilDate();
+
+  await saleRef.set({
+    buyerEmail,
+    amountPen,
+    amountUsd,
+    referralCode: referralCode || null,
+    referrerId: referrer?.id || null,
+    status: "paid",
+    source: source || "manual",
+    createdAt: FieldValue.serverTimestamp(),
+    holdUntil,
+  });
+
+  if (!referrer) {
+    return res.json({ ok: true, saleId, status: "no-referrer" });
+  }
+
+  const uplineChain = [];
+  let currentRef = referrer;
+  for (let level = 1; level <= 4 && currentRef; level += 1) {
+    uplineChain.push({ level, ...currentRef });
+    if (!currentRef.referredBy) break;
+    const nextSnap = await db.collection("users").doc(currentRef.referredBy).get();
+    if (!nextSnap.exists) break;
+    currentRef = { id: nextSnap.id, ...nextSnap.data() };
+  }
+
+  const batch = db.batch();
+  const now = FieldValue.serverTimestamp();
+
+  uplineChain.forEach((upline) => {
+    const allowedLevels = planLevelCap(upline.plan || "basic");
+    if (upline.level > allowedLevels) return;
+
+    const percent = commissionByLevel[upline.level] || 0;
+    if (!percent) return;
+
+    const commissionAmount = round2((amountUsd * percent) / 100);
+    const commissionRef = db.collection("commissions").doc();
+
+    batch.set(commissionRef, {
+      transactionId: saleId,
+      beneficiaryId: upline.id,
+      level: upline.level,
+      percent,
+      amountUsd: commissionAmount,
+      status: "pending",
+      holdUntil,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const statsRef = db.collection("stats").doc(upline.id);
+    batch.set(
+      statsRef,
+      {
+        totalEarningsUsd: FieldValue.increment(commissionAmount),
+        pendingBalanceUsd: FieldValue.increment(commissionAmount),
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+  });
+
+  batch.set(
+    db.collection("users").doc(referrer.id).collection("activity").doc(),
+    {
+      name: buyerEmail,
+      action: "compro el bundle",
+      level: "Venta",
+      time: "Reciente",
+      createdAt: now,
+    }
+  );
+
+  await batch.commit();
+
+  return res.json({ ok: true, saleId, status: "recorded" });
 });
 
 app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {

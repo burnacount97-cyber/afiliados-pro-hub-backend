@@ -13,6 +13,10 @@ Usa Firebase Admin SDK para autenticar y leer/escribir en Firestore.
 - `CORS_ORIGIN`: origen permitido (ej: `https://tu-dominio.vercel.app`).
 - `PORT`: puerto (por defecto 8080).
 - `ADMIN_EMAILS`: lista separada por comas de correos con acceso al panel admin.
+- `SALES_API_KEY`: llave secreta para registrar ventas del bundle.
+- `FX_PEN_TO_USD`: tipo de cambio PEN -> USD (ej: `0.27`).
+- `REFUND_HOLD_DAYS`: dias de retencion antes de liberar comisiones (ej: `14`).
+- `PAYOUT_MIN_USD`: monto minimo para pagos (ej: `100`).
 
 ## Comandos
 ```bash
@@ -34,6 +38,7 @@ gcloud run deploy afiliados-pro-hub-backend --source . --region us-central1 --al
 - `GET /network`
 - `GET /subscription`
 - `POST /subscription/upgrade`
+- `POST /bundle/sales` (requiere `x-sales-key`)
 - `GET /admin/users`
 - `PATCH /admin/users/:uid`
 - `DELETE /admin/users/:uid`
