@@ -6,6 +6,7 @@ import { cert, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
 import { z } from "zod";
+import { getPaypalBaseUrl, getPaypalToken, verifyPaypalWebhook } from "./paypal.js";
 
 const PORT = process.env.PORT || 8080;
 const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -104,6 +105,9 @@ const SALES_API_KEY = process.env.SALES_API_KEY || "";
 const FX_PEN_TO_USD = Number.parseFloat(process.env.FX_PEN_TO_USD || "0.27");
 const REFUND_HOLD_DAYS = Number.parseInt(process.env.REFUND_HOLD_DAYS || "14", 10);
 const PAYOUT_MIN_USD = Number.parseFloat(process.env.PAYOUT_MIN_USD || "100");
+const PAYPAL_PLAN_ID_BASIC = process.env.PAYPAL_PLAN_ID_BASIC || "";
+const PAYPAL_PLAN_ID_PRO = process.env.PAYPAL_PLAN_ID_PRO || "";
+const PAYPAL_PLAN_ID_ELITE = process.env.PAYPAL_PLAN_ID_ELITE || "";
 
 const defaultTools = [
   {
@@ -138,6 +142,25 @@ const planLevelCap = (plan) => {
   if (plan === "elite") return 4;
   if (plan === "pro") return 2;
   return 1;
+};
+
+const planFromId = (planId) => {
+  if (!planId) return null;
+  if (planId === PAYPAL_PLAN_ID_BASIC) return "basic";
+  if (planId === PAYPAL_PLAN_ID_PRO) return "pro";
+  if (planId === PAYPAL_PLAN_ID_ELITE) return "elite";
+  return null;
+};
+
+const getPlanId = (planCode) => {
+  if (planCode === "basic") return PAYPAL_PLAN_ID_BASIC;
+  if (planCode === "pro") return PAYPAL_PLAN_ID_PRO;
+  if (planCode === "elite") return PAYPAL_PLAN_ID_ELITE;
+  return null;
+};
+
+const getBaseUrl = (req) => {
+  return process.env.APP_BASE_URL || req.headers.origin || `https://${req.headers.host}`;
 };
 
 const formatUsd = (value) => `$ ${Number(value || 0).toFixed(2)}`;
@@ -560,6 +583,148 @@ app.post("/subscription/upgrade", requireAuth, async (req, res) => {
   );
 
   res.json({ ok: true, plan });
+});
+
+app.post("/paypal/create-subscription", requireAuth, async (req, res) => {
+  try {
+    const { planCode } = req.body || {};
+    const planId = getPlanId(planCode);
+    if (!planCode || !planId) {
+      return res.status(400).json({ error: "Invalid plan" });
+    }
+
+    const baseUrl = getBaseUrl(req);
+    const returnUrl = `${baseUrl}/subscription?paypal=success`;
+    const cancelUrl = `${baseUrl}/subscription?paypal=cancel`;
+
+    const accessToken = await getPaypalToken();
+    const response = await fetch(`${getPaypalBaseUrl()}/v1/billing/subscriptions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        plan_id: planId,
+        custom_id: `${req.user.uid}:${planCode}`,
+        application_context: {
+          brand_name: "Afiliados PRO",
+          locale: "es-PE",
+          user_action: "SUBSCRIBE_NOW",
+          return_url: returnUrl,
+          cancel_url: cancelUrl,
+        },
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return res.status(response.status).json({ error: data?.message || "PayPal error" });
+    }
+
+    const approval = data?.links?.find((link) => link.rel === "approve");
+    if (!approval?.href) {
+      return res.status(500).json({ error: "No approval link" });
+    }
+
+    await db.collection("users").doc(req.user.uid).set(
+      {
+        paypalSubscriptionId: data.id,
+        paypalPlanId: planId,
+        pendingPlan: planCode,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.status(200).json({ approvalUrl: approval.href, subscriptionId: data.id });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Server error" });
+  }
+});
+
+app.post("/paypal/webhook", async (req, res) => {
+  try {
+    const event = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const ok = await verifyPaypalWebhook(req.headers, event);
+    if (!ok) {
+      return res.status(400).json({ error: "Webhook not verified" });
+    }
+
+    const type = event?.event_type || "";
+    const resource = event?.resource || {};
+    const subscriptionId = resource?.id;
+    const planId = resource?.plan_id;
+    const planCode = planFromId(planId);
+    const customId = resource?.custom_id || "";
+    const [customUid, customPlan] = customId.split(":");
+    const uid = customUid || customId || null;
+
+    let userRef = null;
+    if (uid) {
+      userRef = db.collection("users").doc(uid);
+    } else if (subscriptionId) {
+      const snap = await db
+        .collection("users")
+        .where("paypalSubscriptionId", "==", subscriptionId)
+        .limit(1)
+        .get();
+      if (!snap.empty) {
+        userRef = snap.docs[0].ref;
+      }
+    }
+
+    if (!userRef) {
+      return res.status(200).json({ ok: true, ignored: true });
+    }
+
+    const updates = {
+      paypalSubscriptionId: subscriptionId || null,
+      paypalPlanId: planId || null,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    const finalPlan = planCode || customPlan || "basic";
+
+    if (type === "BILLING.SUBSCRIPTION.ACTIVATED") {
+      updates.status = "ACTIVE";
+      updates.plan = finalPlan;
+      updates.pendingPlan = FieldValue.delete();
+    }
+
+    if (
+      type === "BILLING.SUBSCRIPTION.CANCELLED" ||
+      type === "BILLING.SUBSCRIPTION.SUSPENDED" ||
+      type === "BILLING.SUBSCRIPTION.EXPIRED" ||
+      type === "BILLING.SUBSCRIPTION.PAYMENT.FAILED"
+    ) {
+      updates.status = "SUSPENDED";
+      updates.pendingPlan = FieldValue.delete();
+    }
+
+    if (type === "BILLING.SUBSCRIPTION.UPDATED") {
+      if (resource?.status === "ACTIVE") {
+        updates.status = "ACTIVE";
+        updates.plan = finalPlan;
+        updates.pendingPlan = FieldValue.delete();
+      }
+    }
+
+    await userRef.set(updates, { merge: true });
+    if (updates.plan) {
+      await db.collection("stats").doc(userRef.id).set(
+        {
+          plan: updates.plan,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Webhook error" });
+  }
 });
 
 app.post("/bundle/sales", async (req, res) => {
