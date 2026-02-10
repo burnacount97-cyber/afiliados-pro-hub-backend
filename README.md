@@ -25,6 +25,10 @@ Usa Firebase Admin SDK para autenticar y leer/escribir en Firestore.
 - `PAYPAL_PLAN_ID_PRO`: plan ID PayPal para Pro.
 - `PAYPAL_PLAN_ID_ELITE`: plan ID PayPal para Elite.
 - `APP_BASE_URL`: base URL del frontend para redirecciones (ej: `https://afiliados-pro-hub-sepia.vercel.app`).
+- `CULQI_ENV`: `live` o `test`.
+- `CULQI_PUBLIC_KEY`: public key de Culqi (Checkout).
+- `CULQI_SECRET_KEY`: secret key de Culqi (API).
+- `CULQI_ORDER_EXP_MINUTES`: minutos de expiracion de orden (ej: `30`).
 
 ## Comandos
 ```bash
@@ -48,6 +52,8 @@ gcloud run deploy afiliados-pro-hub-backend --source . --region us-central1 --al
 - `POST /subscription/upgrade`
 - `POST /paypal/create-subscription` (requiere auth Firebase)
 - `POST /paypal/webhook` (webhook de PayPal)
+- `POST /culqi/orders` (requiere auth Firebase)
+- `POST /culqi/webhook` (webhook de Culqi)
 - `POST /bundle/sales` (requiere `x-sales-key`)
 - `GET /admin/users`
 - `PATCH /admin/users/:uid`

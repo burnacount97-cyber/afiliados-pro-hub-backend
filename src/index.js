@@ -7,6 +7,7 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
 import { z } from "zod";
 import { getPaypalBaseUrl, getPaypalToken, verifyPaypalWebhook } from "./paypal.js";
+import { createCulqiOrder } from "./culqi.js";
 
 const PORT = process.env.PORT || 8080;
 const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -30,14 +31,15 @@ const adminEmails = (process.env.ADMIN_EMAILS || "")
 
 const allowedOrigins = (process.env.CORS_ORIGIN || "*")
   .split(",")
-  .map((origin) => origin.trim())
+  .map((origin) => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+      const cleanOrigin = origin.replace(/\/$/, "");
+      if (allowedOrigins.includes("*") || allowedOrigins.includes(cleanOrigin)) {
         return callback(null, true);
       }
       return callback(new Error("CORS_NOT_ALLOWED"), false);
@@ -108,6 +110,15 @@ const PAYOUT_MIN_USD = Number.parseFloat(process.env.PAYOUT_MIN_USD || "100");
 const PAYPAL_PLAN_ID_BASIC = process.env.PAYPAL_PLAN_ID_BASIC || "";
 const PAYPAL_PLAN_ID_PRO = process.env.PAYPAL_PLAN_ID_PRO || "";
 const PAYPAL_PLAN_ID_ELITE = process.env.PAYPAL_PLAN_ID_ELITE || "";
+const CULQI_PUBLIC_KEY = process.env.CULQI_PUBLIC_KEY || "";
+const CULQI_SECRET_KEY = process.env.CULQI_SECRET_KEY || "";
+const CULQI_ORDER_EXP_MINUTES = Number.parseInt(process.env.CULQI_ORDER_EXP_MINUTES || "30", 10);
+
+const planPricesPen = {
+  basic: 50,
+  pro: 75,
+  elite: 99,
+};
 
 const defaultTools = [
   {
@@ -168,6 +179,20 @@ const round2 = (value) => Math.round(Number(value) * 100) / 100;
 const penToUsd = (penValue) => round2(Number(penValue || 0) * FX_PEN_TO_USD);
 const holdUntilDate = () =>
   Timestamp.fromDate(new Date(Date.now() + REFUND_HOLD_DAYS * 24 * 60 * 60 * 1000));
+const getPlanPricePen = (plan) => planPricesPen[plan] ?? null;
+const toCulqiAmount = (penValue) => Math.round(Number(penValue || 0) * 100);
+const buildOrderNumber = () =>
+  `AP-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+const splitName = (fullName) => {
+  const cleaned = (fullName || "").trim();
+  if (!cleaned) return { firstName: "Afiliados", lastName: "PRO" };
+  const parts = cleaned.split(/\s+/);
+  return {
+    firstName: parts[0] || "Afiliados",
+    lastName: parts.slice(1).join(" ") || "PRO",
+  };
+};
 
 const requireAuth = async (req, res, next) => {
   const header = req.headers.authorization || "";
@@ -247,6 +272,27 @@ const serializeUser = (doc) => {
     disabled: !!doc.disabled,
     createdAt: doc.createdAt || null,
   };
+};
+
+const updateUserPlan = async ({ uid, plan, status, source, payload }) => {
+  const updates = {
+    ...(plan ? { plan } : {}),
+    ...(status ? { status } : {}),
+    ...(source ? { planSource: source } : {}),
+    ...(payload ? { paymentMeta: payload } : {}),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  await db.collection("users").doc(uid).set(updates, { merge: true });
+  if (plan) {
+    await db.collection("stats").doc(uid).set(
+      {
+        plan,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
 };
 
 const fetchUsersByReferrers = async (referrerIds = []) => {
@@ -719,6 +765,121 @@ app.post("/paypal/webhook", async (req, res) => {
         },
         { merge: true }
       );
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Webhook error" });
+  }
+});
+
+app.post("/culqi/orders", requireAuth, async (req, res) => {
+  if (!CULQI_SECRET_KEY || !CULQI_PUBLIC_KEY) {
+    return res.status(500).json({ error: "Culqi not configured" });
+  }
+
+  const schema = z
+    .object({
+      plan: z.enum(["basic", "pro", "elite"]),
+      phone: z.string().min(9).max(15),
+      paymentMethod: z.enum(["yape", "plin"]).optional(),
+    })
+    .safeParse(req.body || {});
+
+  if (!schema.success) {
+    return res.status(400).json({ error: "Invalid payload" });
+  }
+
+  const { plan, phone, paymentMethod } = schema.data;
+  const amountPen = getPlanPricePen(plan);
+  if (!amountPen) {
+    return res.status(400).json({ error: "Invalid plan" });
+  }
+
+  const { firstName, lastName } = splitName(req.user?.name || req.user?.email || "");
+  const amount = toCulqiAmount(amountPen);
+  const orderNumber = buildOrderNumber();
+  const expirationDate = Math.floor(Date.now() / 1000) + CULQI_ORDER_EXP_MINUTES * 60;
+
+  try {
+    const order = await createCulqiOrder({
+      amount,
+      currency_code: "PEN",
+      description: `Afiliados PRO - Plan ${plan.toUpperCase()}`,
+      order_number: orderNumber,
+      client_details: {
+        first_name: firstName,
+        last_name: lastName,
+        email: req.user?.email || "cliente@afiliadospro.com",
+        phone_number: phone,
+      },
+      expiration_date: expirationDate,
+    });
+
+    await db.collection("culqiOrders").doc(order.id).set({
+      uid: req.user.uid,
+      plan,
+      paymentMethod: paymentMethod || "yape",
+      amountPen,
+      amount,
+      status: order.state || order.status || "pending",
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    return res.json({
+      orderId: order.id,
+      publicKey: CULQI_PUBLIC_KEY,
+      amount,
+      currencyCode: "PEN",
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Culqi error" });
+  }
+});
+
+app.post("/culqi/webhook", async (req, res) => {
+  try {
+    const event = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const eventType = event?.type || event?.event_type || "";
+    if (!eventType) {
+      return res.status(400).json({ error: "Missing event type" });
+    }
+
+    const payload = event?.data?.object || event?.data || {};
+    const orderId = payload?.id || payload?.order_id;
+    if (!orderId) {
+      return res.status(200).json({ ok: true, ignored: true });
+    }
+
+    const status = String(payload?.state || payload?.status || "").toLowerCase();
+
+    await db.collection("culqiOrders").doc(orderId).set(
+      {
+        status: status || "unknown",
+        rawEventType: eventType,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    if (eventType === "order.status.changed" && status === "paid") {
+      const orderSnap = await db.collection("culqiOrders").doc(orderId).get();
+      if (orderSnap.exists) {
+        const orderData = orderSnap.data();
+        if (orderData?.uid && orderData?.plan) {
+          await updateUserPlan({
+            uid: orderData.uid,
+            plan: orderData.plan,
+            status: "ACTIVE",
+            source: "culqi",
+            payload: {
+              culqiOrderId: orderId,
+              method: orderData.paymentMethod || "yape",
+            },
+          });
+        }
+      }
     }
 
     return res.status(200).json({ ok: true });
